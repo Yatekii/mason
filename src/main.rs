@@ -6,6 +6,8 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
+actions!(mason, [Quit]);
+
 #[derive(Clone, Debug)]
 struct MemoryRegion {
     name: String,
@@ -221,25 +223,14 @@ fn detect_conflicts(segments: &mut [MemorySegment], memory_regions: &[MemoryRegi
 struct MemoryView {
     segments: Vec<MemorySegment>,
     memory_regions: Vec<MemoryRegion>,
-    min_address: u64,
-    max_address: u64,
     selected_segment: Option<usize>,
 }
 
 impl MemoryView {
     fn new(segments: Vec<MemorySegment>, memory_regions: Vec<MemoryRegion>) -> Self {
-        let min_address = segments.iter().map(|s| s.address).min().unwrap_or(0);
-        let max_address = segments
-            .iter()
-            .map(|s| s.address + s.size)
-            .max()
-            .unwrap_or(0);
-
         Self {
             segments,
             memory_regions,
-            min_address,
-            max_address,
             selected_segment: None,
         }
     }
@@ -264,39 +255,51 @@ impl MemoryView {
 
 impl Render for MemoryView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Calculate total size as sum of all section sizes (not address range)
-        let total_size: u64 = self.segments.iter().map(|s| s.size).sum();
-        let min_height_px = 40.0; // Minimum clickable height
         let padding = 20.0;
         let selected_segment = self.selected_segment;
 
-        // Calculate dynamic scale factor to prevent overflow
-        // First pass: count sections that would be below minimum height
+        // Calculate total size of all segments
+        let total_size: u64 = self.segments.iter().map(|s| s.size).sum();
+
+        // Count gaps between segments
+        let gap_count = self.segments.windows(2).filter(|pair| {
+            let current_end = pair[0].address + pair[0].size;
+            current_end < pair[1].address
+        }).count();
+
+        // Target total height for visualization
         let target_total_height = 600.0;
-        let mut sections_at_min = 0;
-        let mut remaining_proportion = 0.0;
+        let gap_height = 10.0;
+        let min_block_height = 20.0;
+
+        // Calculate available height after accounting for gaps
+        let available_for_sections = target_total_height - (gap_count as f64 * gap_height);
+
+        // First pass: determine which sections need minimum height with naive scale
+        let naive_scale = if total_size > 0 {
+            available_for_sections / total_size as f64
+        } else {
+            1.0
+        };
+
+        let mut small_sections_count = 0;
+        let mut large_sections_total_size = 0u64;
 
         for segment in &self.segments {
-            let proportion = if total_size > 0 {
-                segment.size as f64 / total_size as f64
+            let naive_height = segment.size as f64 * naive_scale;
+            if naive_height < min_block_height {
+                small_sections_count += 1;
             } else {
-                0.0
-            };
-            let test_height = proportion * target_total_height;
-            if test_height < min_height_px {
-                sections_at_min += 1;
-            } else {
-                remaining_proportion += proportion;
+                large_sections_total_size += segment.size;
             }
         }
 
-        // Calculate scale factor: remaining space divided by remaining proportion
-        let used_by_min = sections_at_min as f64 * min_height_px;
-        let available_for_large = target_total_height - used_by_min;
-        let scale_factor = if remaining_proportion > 0.0 {
-            available_for_large / remaining_proportion
+        // Calculate final scale factor accounting for minimum heights
+        let available_for_large_sections = available_for_sections - (small_sections_count as f64 * min_block_height);
+        let scale_factor = if large_sections_total_size > 0 {
+            available_for_large_sections / large_sections_total_size as f64
         } else {
-            target_total_height
+            1.0
         };
 
         div()
@@ -324,15 +327,14 @@ impl Render for MemoryView {
                 div()
                     .flex()
                     .flex_1()
-                    .child(
+                    .child({
                         // ELF Sections visualization panel
-                        div()
+                        let mut sections_panel = div()
                             .id("memory_panel")
                             .flex()
                             .flex_col()
                             .w(relative(0.5))
                             .p(px(padding))
-                            .gap_2()
                             .overflow_y_scroll()
                             .child(
                                 div()
@@ -341,22 +343,18 @@ impl Render for MemoryView {
                                     .text_color(rgb(0xaaaaaa))
                                     .mb_3()
                                     .child("ELF Sections"),
-                            )
-                            .children(self.segments.iter().enumerate().map(|(idx, segment)| {
-                                // Calculate proportion based on actual section size
-                                let proportion = if total_size > 0 {
-                                    segment.size as f64 / total_size as f64
-                                } else {
-                                    0.0
-                                };
-                                let calculated_height = proportion * scale_factor;
-                                let height = calculated_height.max(min_height_px) as f32;
+                            );
 
-                                let _is_selected = selected_segment == Some(idx);
-                                let has_conflicts = !segment.conflicts.is_empty();
-                                let color = Self::generate_color(idx);
-                                let white: Hsla = rgb(0xffffff).into();
+                        for (idx, segment) in self.segments.iter().enumerate() {
+                            // Calculate height based on actual memory size
+                            let height = (segment.size as f64 * scale_factor).max(min_block_height) as f32;
 
+                            let _is_selected = selected_segment == Some(idx);
+                            let has_conflicts = !segment.conflicts.is_empty();
+                            let color = Self::generate_color(idx);
+                            let white: Hsla = rgb(0xffffff).into();
+
+                            sections_panel = sections_panel.child(
                                 div()
                                     .id(idx)
                                     .flex()
@@ -406,8 +404,25 @@ impl Render for MemoryView {
                                             .flex_shrink_0()
                                             .child(format!("{}", segment.flags)),
                                     )
-                            })),
-                    )
+                            );
+
+                            // Check if there's a gap between this segment and the next
+                            if idx + 1 < self.segments.len() {
+                                let next_segment = &self.segments[idx + 1];
+                                let current_end = segment.address + segment.size;
+                                if current_end < next_segment.address {
+                                    // There's a gap, insert a visual separator
+                                    sections_panel = sections_panel.child(
+                                        div()
+                                            .h(px(gap_height as f32))
+                                            .bg(rgb(0x1e1e1e))
+                                    );
+                                }
+                            }
+                        }
+
+                        sections_panel
+                    })
                     .child(self.render_memory_regions_panel())
                     .child(self.render_details_panel(total_size)),
             )
@@ -416,44 +431,57 @@ impl Render for MemoryView {
 
 impl MemoryView {
     fn render_memory_regions_panel(&self) -> impl IntoElement {
-        let total_size: u64 = self.memory_regions.iter().map(|r| r.size).sum();
-        let min_height_px = 40.0;
         let padding = 20.0;
 
-        // Calculate dynamic scale factor
+        // Calculate total size of all regions
+        let total_size: u64 = self.memory_regions.iter().map(|r| r.size).sum();
+
+        // Count gaps between regions
+        let gap_count = self.memory_regions.windows(2).filter(|pair| {
+            let current_end = pair[0].start + pair[0].size;
+            current_end < pair[1].start
+        }).count();
+
         let target_total_height = 600.0;
-        let mut regions_at_min = 0;
-        let mut remaining_proportion = 0.0;
+        let gap_height = 10.0;
+        let min_block_height = 20.0;
+
+        // Calculate available height after accounting for gaps
+        let available_for_regions = target_total_height - (gap_count as f64 * gap_height);
+
+        // First pass: determine which regions need minimum height with naive scale
+        let naive_scale = if total_size > 0 {
+            available_for_regions / total_size as f64
+        } else {
+            1.0
+        };
+
+        let mut small_regions_count = 0;
+        let mut large_regions_total_size = 0u64;
 
         for region in &self.memory_regions {
-            let proportion = if total_size > 0 {
-                region.size as f64 / total_size as f64
+            let naive_height = region.size as f64 * naive_scale;
+            if naive_height < min_block_height {
+                small_regions_count += 1;
             } else {
-                0.0
-            };
-            let test_height = proportion * target_total_height;
-            if test_height < min_height_px {
-                regions_at_min += 1;
-            } else {
-                remaining_proportion += proportion;
+                large_regions_total_size += region.size;
             }
         }
 
-        let used_by_min = regions_at_min as f64 * min_height_px;
-        let available_for_large = target_total_height - used_by_min;
-        let scale_factor = if remaining_proportion > 0.0 {
-            available_for_large / remaining_proportion
+        // Calculate final scale factor accounting for minimum heights
+        let available_for_large_regions = available_for_regions - (small_regions_count as f64 * min_block_height);
+        let scale_factor = if large_regions_total_size > 0 {
+            available_for_large_regions / large_regions_total_size as f64
         } else {
-            target_total_height
+            1.0
         };
 
-        div()
+        let mut panel = div()
             .id("regions_panel")
             .flex()
             .flex_col()
             .w(relative(0.5))
             .p(px(padding))
-            .gap_2()
             .overflow_y_scroll()
             .child(
                 div()
@@ -462,23 +490,19 @@ impl MemoryView {
                     .text_color(rgb(0xaaaaaa))
                     .mb_3()
                     .child("Memory Regions"),
-            )
-            .children(self.memory_regions.iter().map(|region| {
-                let proportion = if total_size > 0 {
-                    region.size as f64 / total_size as f64
-                } else {
-                    0.0
-                };
-                let calculated_height = proportion * scale_factor;
-                let height = calculated_height.max(min_height_px) as f32;
+            );
 
-                let color = match region.kind {
-                    MemoryKind::Flash => hsla(30.0 / 360.0, 0.7, 0.5, 1.0), // Orange
-                    MemoryKind::Ram => hsla(200.0 / 360.0, 0.7, 0.5, 1.0),   // Blue
-                };
+        for (i, region) in self.memory_regions.iter().enumerate() {
+            let height = (region.size as f64 * scale_factor).max(min_block_height) as f32;
 
-                let white: Hsla = rgb(0xffffff).into();
+            let color = match region.kind {
+                MemoryKind::Flash => hsla(30.0 / 360.0, 0.7, 0.5, 1.0), // Orange
+                MemoryKind::Ram => hsla(200.0 / 360.0, 0.7, 0.5, 1.0),   // Blue
+            };
 
+            let white: Hsla = rgb(0xffffff).into();
+
+            panel = panel.child(
                 div()
                     .flex()
                     .flex_row()
@@ -517,7 +541,24 @@ impl MemoryView {
                             .flex_shrink_0()
                             .child(format!("{:?}", region.kind)),
                     )
-            }))
+            );
+
+            // Check if there's a gap between this region and the next
+            if i + 1 < self.memory_regions.len() {
+                let next_region = &self.memory_regions[i + 1];
+                let current_end = region.start + region.size;
+                if current_end < next_region.start {
+                    // There's a gap, insert a visual separator
+                    panel = panel.child(
+                        div()
+                            .h(px(gap_height as f32))
+                            .bg(rgb(0x1e1e1e))
+                    );
+                }
+            }
+        }
+
+        panel
     }
 
     fn render_details_panel(&self, total_size: u64) -> impl IntoElement {
@@ -671,7 +712,14 @@ fn main() -> Result<()> {
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1200.0), px(800.0)), cx);
-        cx.open_window(
+
+        // Set up keyboard bindings
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+
+        // Handle quit action
+        cx.on_action(|_: &Quit, cx| cx.quit());
+
+        let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
@@ -685,6 +733,11 @@ fn main() -> Result<()> {
             },
         )
         .unwrap();
+
+        // Get the view entity and observe when it's released (window closed)
+        let view = window.update(cx, |_, _, cx| cx.entity()).unwrap();
+        cx.observe_release(&view, |_, cx| cx.quit()).detach();
+
         cx.activate(true);
     });
 
