@@ -1,6 +1,6 @@
 use anyhow::{Context as AnyhowContext, Result};
 use gpui::{prelude::*, *};
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSymbol, Endianness};
 use probe_rs::config::MemoryRegion as ProbeRsMemoryRegion;
 use std::env;
 use std::fs;
@@ -30,6 +30,31 @@ struct MemorySegment {
     flags: String,
     is_load: bool,
     conflicts: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct DefmtInfo {
+    present: bool,
+    sections: Vec<(String, u64)>, // (section_name, size)
+}
+
+#[derive(Clone, Debug)]
+struct RttBufferDesc {
+    name: String,
+    buffer_address: u64,
+    size: u32,
+}
+
+#[derive(Clone, Debug)]
+struct RttInfo {
+    present: bool,
+    symbol_name: Option<String>,
+    address: Option<u64>,
+    size: Option<u64>,
+    max_up_buffers: Option<u32>,
+    max_down_buffers: Option<u32>,
+    up_buffers: Vec<RttBufferDesc>,
+    down_buffers: Vec<RttBufferDesc>,
 }
 
 impl MemoryRegion {
@@ -101,6 +126,204 @@ fn load_memory_layout_from_probe_rs(target_name: &str) -> Result<Vec<MemoryRegio
     Ok(regions)
 }
 
+
+fn parse_defmt_info(path: &PathBuf) -> Result<DefmtInfo> {
+    let data = fs::read(path).context("Failed to read ELF file")?;
+    let obj = object::File::parse(&*data).context("Failed to parse ELF file")?;
+
+    let mut defmt_sections = Vec::new();
+
+    for section in obj.sections() {
+        let name = section.name().unwrap_or("");
+        // Look for defmt-related sections
+        if name.starts_with(".defmt") || name.contains("defmt") {
+            let size = section.size();
+            if size > 0 {
+                defmt_sections.push((name.to_string(), size));
+            }
+        }
+    }
+
+    Ok(DefmtInfo {
+        present: !defmt_sections.is_empty(),
+        sections: defmt_sections,
+    })
+}
+
+fn parse_rtt_info(path: &PathBuf) -> Result<RttInfo> {
+    let data = fs::read(path).context("Failed to read ELF file")?;
+    let obj = object::File::parse(&*data).context("Failed to parse ELF file")?;
+
+    // Determine if this is 32-bit or 64-bit
+    let is_64bit = obj.is_64();
+    let ptr_size = if is_64bit { 8 } else { 4 };
+
+    // Look for RTT control block symbol
+    for symbol in obj.symbols() {
+        if let Ok(name) = symbol.name() {
+            // Common RTT symbol names
+            if name == "_SEGGER_RTT" || name == "SEGGER_RTT" || name.contains("_SEGGER_RTT") {
+                let address = symbol.address();
+                let size = symbol.size();
+
+                // Try to find the section containing this address and read the data
+                let mut rtt_data: Option<&[u8]> = None;
+                for section in obj.sections() {
+                    let section_addr = section.address();
+                    let section_size = section.size();
+                    if address >= section_addr && address < section_addr + section_size {
+                        if let Ok(section_data) = section.data() {
+                            let offset = (address - section_addr) as usize;
+                            if offset < section_data.len() {
+                                rtt_data = Some(&section_data[offset..]);
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                // Parse RTT control block structure if we have data
+                let (max_up, max_down, up_buffers, down_buffers) = if let Some(rtt_bytes) = rtt_data {
+                    decode_rtt_control_block(rtt_bytes, ptr_size, obj.endianness())
+                } else {
+                    (None, None, Vec::new(), Vec::new())
+                };
+
+                return Ok(RttInfo {
+                    present: true,
+                    symbol_name: Some(name.to_string()),
+                    address: Some(address),
+                    size: if size > 0 { Some(size) } else { None },
+                    max_up_buffers: max_up,
+                    max_down_buffers: max_down,
+                    up_buffers,
+                    down_buffers,
+                });
+            }
+        }
+    }
+
+    Ok(RttInfo {
+        present: false,
+        symbol_name: None,
+        address: None,
+        size: None,
+        max_up_buffers: None,
+        max_down_buffers: None,
+        up_buffers: Vec::new(),
+        down_buffers: Vec::new(),
+    })
+}
+
+fn decode_rtt_control_block(data: &[u8], ptr_size: usize, endian: Endianness) -> (Option<u32>, Option<u32>, Vec<RttBufferDesc>, Vec<RttBufferDesc>) {
+    if data.len() < 24 {
+        return (None, None, Vec::new(), Vec::new());
+    }
+
+    // RTT Control Block structure:
+    // char acID[16];           // offset 0
+    // int MaxNumUpBuffers;     // offset 16
+    // int MaxNumDownBuffers;   // offset 20
+    // SEGGER_RTT_BUFFER_UP aUp[...];     // offset 24
+    // SEGGER_RTT_BUFFER_DOWN aDown[...]; // after up buffers
+
+    let read_u32 = |offset: usize| -> Option<u32> {
+        if offset + 4 > data.len() {
+            return None;
+        }
+        let bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
+        Some(match endian {
+            Endianness::Little => u32::from_le_bytes(bytes),
+            Endianness::Big => u32::from_be_bytes(bytes),
+        })
+    };
+
+    let read_ptr = |offset: usize| -> Option<u64> {
+        if offset + ptr_size > data.len() {
+            return None;
+        }
+        Some(if ptr_size == 4 {
+            let bytes = [data[offset], data[offset+1], data[offset+2], data[offset+3]];
+            match endian {
+                Endianness::Little => u32::from_le_bytes(bytes) as u64,
+                Endianness::Big => u32::from_be_bytes(bytes) as u64,
+            }
+        } else {
+            let bytes = [
+                data[offset], data[offset+1], data[offset+2], data[offset+3],
+                data[offset+4], data[offset+5], data[offset+6], data[offset+7]
+            ];
+            match endian {
+                Endianness::Little => u64::from_le_bytes(bytes),
+                Endianness::Big => u64::from_be_bytes(bytes),
+            }
+        })
+    };
+
+    let max_up = read_u32(16);
+    let max_down = read_u32(20);
+
+    let mut up_buffers = Vec::new();
+    let mut down_buffers = Vec::new();
+
+    // Parse buffer descriptors
+    // Each buffer descriptor:
+    // const char* sName;      // offset 0
+    // char* pBuffer;          // offset ptr_size
+    // unsigned int SizeOfBuffer; // offset 2*ptr_size
+    // unsigned int WrOff;     // offset 2*ptr_size + 4
+    // unsigned int RdOff;     // offset 2*ptr_size + 8
+    // unsigned int Flags;     // offset 2*ptr_size + 12
+    let buffer_desc_size = 2 * ptr_size + 16;
+
+    if let (Some(max_up_count), Some(max_down_count)) = (max_up, max_down) {
+        let up_buffers_offset = 24;
+
+        for i in 0..max_up_count.min(16) { // Limit to reasonable number
+            let offset = up_buffers_offset + (i as usize * buffer_desc_size);
+            if offset + buffer_desc_size > data.len() {
+                break;
+            }
+
+            if let (Some(buffer_addr), Some(buffer_size)) = (
+                read_ptr(offset + ptr_size),
+                read_u32(offset + 2 * ptr_size)
+            ) {
+                if buffer_addr != 0 && buffer_size > 0 {
+                    up_buffers.push(RttBufferDesc {
+                        name: format!("Up {}", i),
+                        buffer_address: buffer_addr,
+                        size: buffer_size,
+                    });
+                }
+            }
+        }
+
+        let down_buffers_offset = up_buffers_offset + (max_up_count as usize * buffer_desc_size);
+
+        for i in 0..max_down_count.min(16) {
+            let offset = down_buffers_offset + (i as usize * buffer_desc_size);
+            if offset + buffer_desc_size > data.len() {
+                break;
+            }
+
+            if let (Some(buffer_addr), Some(buffer_size)) = (
+                read_ptr(offset + ptr_size),
+                read_u32(offset + 2 * ptr_size)
+            ) {
+                if buffer_addr != 0 && buffer_size > 0 {
+                    down_buffers.push(RttBufferDesc {
+                        name: format!("Down {}", i),
+                        buffer_address: buffer_addr,
+                        size: buffer_size,
+                    });
+                }
+            }
+        }
+    }
+
+    (max_up, max_down, up_buffers, down_buffers)
+}
 
 fn parse_elf_segments(path: &PathBuf, memory_regions: &[MemoryRegion]) -> Result<Vec<MemorySegment>> {
     let data = fs::read(path).context("Failed to read ELF file")?;
@@ -223,14 +446,18 @@ fn detect_conflicts(segments: &mut [MemorySegment], memory_regions: &[MemoryRegi
 struct MemoryView {
     segments: Vec<MemorySegment>,
     memory_regions: Vec<MemoryRegion>,
+    defmt_info: DefmtInfo,
+    rtt_info: RttInfo,
     selected_segment: Option<usize>,
 }
 
 impl MemoryView {
-    fn new(segments: Vec<MemorySegment>, memory_regions: Vec<MemoryRegion>) -> Self {
+    fn new(segments: Vec<MemorySegment>, memory_regions: Vec<MemoryRegion>, defmt_info: DefmtInfo, rtt_info: RttInfo) -> Self {
         Self {
             segments,
             memory_regions,
+            defmt_info,
+            rtt_info,
             selected_segment: None,
         }
     }
@@ -327,6 +554,7 @@ impl Render for MemoryView {
                 div()
                     .flex()
                     .flex_1()
+                    .overflow_hidden()
                     .child({
                         // ELF Sections visualization panel
                         let mut sections_panel = div()
@@ -334,6 +562,7 @@ impl Render for MemoryView {
                             .flex()
                             .flex_col()
                             .w(relative(0.5))
+                            .h_full()
                             .p(px(padding))
                             .overflow_y_scroll()
                             .child(
@@ -481,6 +710,7 @@ impl MemoryView {
             .flex()
             .flex_col()
             .w(relative(0.5))
+            .h_full()
             .p(px(padding))
             .overflow_y_scroll()
             .child(
@@ -562,15 +792,161 @@ impl MemoryView {
     }
 
     fn render_details_panel(&self, total_size: u64) -> impl IntoElement {
-        div()
+        let mut panel = div()
             .id("details_panel")
+            .flex()
+            .flex_col()
             .w(px(350.0))
+            .h_full()
             .bg(rgb(0x252525))
             .border_l_1()
             .border_color(rgb(0x3d3d3d))
             .p_4()
-            .overflow_y_scroll()
-            .when_some(self.selected_segment, |panel, idx| {
+            .overflow_y_scroll();
+
+        // Add defmt info section if present
+        if self.defmt_info.present {
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .mb_4()
+                    .pb_4()
+                    .border_b_1()
+                    .border_color(rgb(0x3d3d3d))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0x66ff66))
+                            .mb_3()
+                            .child("✓ defmt Debug Symbols"),
+                    )
+                    .child(detail_row(
+                        "Status",
+                        "Present"
+                    ))
+                    .child(detail_row(
+                        "Sections",
+                        format!("{}", self.defmt_info.sections.len())
+                    ))
+                    .children(self.defmt_info.sections.iter().map(|(name, size)| {
+                        detail_row(name.clone(), format_size(*size))
+                    }))
+            );
+        }
+
+        // Add RTT info section if present
+        if self.rtt_info.present {
+            let mut rtt_section = div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .mb_4()
+                .pb_4()
+                .border_b_1()
+                .border_color(rgb(0x3d3d3d))
+                .child(
+                    div()
+                        .text_lg()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0x66ff66))
+                        .mb_3()
+                        .child("✓ RTT Control Block"),
+                )
+                .child(detail_row(
+                    "Status",
+                    "Present"
+                ))
+                .when_some(self.rtt_info.symbol_name.as_ref(), |parent, name| {
+                    parent.child(detail_row("Symbol", name.clone()))
+                })
+                .when_some(self.rtt_info.address, |parent, addr| {
+                    parent.child(detail_row("Address", format!("0x{:08x}", addr)))
+                })
+                .when_some(self.rtt_info.size, |parent, size| {
+                    parent.child(detail_row("Size", format_size(size)))
+                });
+
+            // Add buffer configuration info
+            if let Some(max_up) = self.rtt_info.max_up_buffers {
+                rtt_section = rtt_section.child(detail_row("Max Up Buffers", format!("{}", max_up)));
+            }
+            if let Some(max_down) = self.rtt_info.max_down_buffers {
+                rtt_section = rtt_section.child(detail_row("Max Down Buffers", format!("{}", max_down)));
+            }
+
+            // Add up buffers
+            if !self.rtt_info.up_buffers.is_empty() {
+                rtt_section = rtt_section.child(
+                    div()
+                        .mt_2()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xaaaaaa))
+                        .child("Up Buffers:")
+                );
+                for buffer in &self.rtt_info.up_buffers {
+                    rtt_section = rtt_section.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .ml_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x888888))
+                                    .child(format!("{}:", buffer.name))
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xcccccc))
+                                    .child(format!("  Address: 0x{:08x}, Size: {}", buffer.buffer_address, format_size(buffer.size as u64)))
+                            )
+                    );
+                }
+            }
+
+            // Add down buffers
+            if !self.rtt_info.down_buffers.is_empty() {
+                rtt_section = rtt_section.child(
+                    div()
+                        .mt_2()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(rgb(0xaaaaaa))
+                        .child("Down Buffers:")
+                );
+                for buffer in &self.rtt_info.down_buffers {
+                    rtt_section = rtt_section.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .ml_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0x888888))
+                                    .child(format!("{}:", buffer.name))
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xcccccc))
+                                    .child(format!("  Address: 0x{:08x}, Size: {}", buffer.buffer_address, format_size(buffer.size as u64)))
+                            )
+                    );
+                }
+            }
+
+            panel = panel.child(rtt_section);
+        }
+
+        panel = panel.when_some(self.selected_segment, |panel, idx| {
                 let segment = &self.segments[idx];
                 panel.child(
                     div()
@@ -626,7 +1002,9 @@ impl MemoryView {
                             )
                         }),
                 )
-            })
+            });
+
+        panel
     }
 }
 
@@ -705,6 +1083,9 @@ fn main() -> Result<()> {
         eprintln!("Warning: No loadable segments found in ELF file");
     }
 
+    let defmt_info = parse_defmt_info(&elf_path).context("Failed to parse defmt info")?;
+    let rtt_info = parse_rtt_info(&elf_path).context("Failed to parse RTT info")?;
+
     let title = format!(
         "ELF Memory Viewer - {}",
         elf_path.file_name().unwrap().to_string_lossy()
@@ -729,7 +1110,7 @@ fn main() -> Result<()> {
                 ..Default::default()
             },
             |_, cx| {
-                cx.new(|_| MemoryView::new(segments.clone(), memory_regions.clone()))
+                cx.new(|_| MemoryView::new(segments.clone(), memory_regions.clone(), defmt_info.clone(), rtt_info.clone()))
             },
         )
         .unwrap();
