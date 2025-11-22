@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gpui = { git = "https://github.com/zed-industries/zed" }
+gpui = "0.2.2"
+gpui-component = { path = "../gpui-component/crates/ui" }
 object = "0.36"
 anyhow = "1.0"
 probe-rs = "0.24"
