@@ -3,6 +3,7 @@
 mod details_panel;
 mod sections_panel;
 mod regions_panel;
+pub mod symbols_panel;
 mod memory_view;
 // pub mod target_selector; // No longer used - replaced with gpui-component Select
 

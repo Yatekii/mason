@@ -5,7 +5,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use crate::types::{
-    DefmtInfo, MemoryKind, MemoryRegion, MemorySegment, RttBufferDesc, RttInfo,
+    DefmtInfo, ElfSymbol, MemoryKind, MemoryRegion, MemorySegment, RttBufferDesc, RttInfo,
 };
 
 pub fn get_all_targets() -> Vec<String> {
@@ -435,4 +435,33 @@ fn detect_conflicts(segments: &mut [MemorySegment], memory_regions: &[MemoryRegi
 
         segments[i].conflicts = conflicts;
     }
+}
+
+pub fn parse_elf_symbols(path: &PathBuf) -> Result<Vec<ElfSymbol>> {
+    let data = fs::read(path).context("Failed to read ELF file")?;
+    let obj = object::File::parse(&*data).context("Failed to parse ELF file")?;
+
+    let mut symbols = Vec::new();
+
+    for symbol in obj.symbols() {
+        // Only include symbols with valid names and addresses
+        if let Ok(name) = symbol.name() {
+            let address = symbol.address();
+            let size = symbol.size();
+
+            // Skip symbols with zero address or empty names
+            if address > 0 && !name.is_empty() {
+                symbols.push(ElfSymbol {
+                    name: name.to_string(),
+                    address,
+                    size,
+                });
+            }
+        }
+    }
+
+    // Sort by address
+    symbols.sort_by_key(|s| s.address);
+
+    Ok(symbols)
 }

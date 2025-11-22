@@ -23,6 +23,13 @@ pub struct MemorySegment {
 }
 
 #[derive(Clone, Debug)]
+pub struct ElfSymbol {
+    pub name: String,
+    pub address: u64,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug)]
 pub struct DefmtInfo {
     pub present: bool,
     pub sections: Vec<(String, u64)>, // (section_name, size)

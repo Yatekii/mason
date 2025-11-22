@@ -1,20 +1,27 @@
+use crate::components::symbols_panel::SymbolsTableDelegate;
+use crate::components::{render_regions_panel, render_sections_panel, DetailsPanel};
+use crate::parser::{
+    get_all_targets, load_memory_layout_from_probe_rs, parse_defmt_info, parse_elf_segments,
+    parse_rtt_info,
+};
+use crate::types::{DefmtInfo, ElfSymbol, MemoryRegion, MemorySegment, RttInfo};
 use gpui::{prelude::*, *};
-use std::path::PathBuf;
-use crate::types::{DefmtInfo, MemoryRegion, MemorySegment, RttInfo};
-use crate::components::{DetailsPanel, render_regions_panel, render_sections_panel};
-use crate::parser::{get_all_targets, load_memory_layout_from_probe_rs, parse_elf_segments, parse_defmt_info, parse_rtt_info};
-use gpui_component::select::{Select, SelectState, SearchableVec, SelectEvent};
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
+use gpui_component::table::{Table, TableState};
+use gpui_component::theme::{Theme, ThemeRegistry};
 use gpui_component::IndexPath;
 use gpui_component::TitleBar;
 use gpui_component::{v_flex, ActiveTheme, Sizable};
-use gpui_component::theme::{Theme, ThemeRegistry};
+use std::path::PathBuf;
 
 pub struct MemoryView {
     segments: Vec<MemorySegment>,
     memory_regions: Vec<MemoryRegion>,
+    symbols: Vec<ElfSymbol>,
     defmt_info: DefmtInfo,
     rtt_info: RttInfo,
     selected_segment: Option<usize>,
+    symbols_table: Option<Entity<TableState<SymbolsTableDelegate>>>,
     target_select: Entity<SelectState<SearchableVec<String>>>,
     theme_select: Entity<SelectState<SearchableVec<String>>>,
     elf_path: PathBuf,
@@ -31,6 +38,7 @@ impl MemoryView {
     pub fn new(
         segments: Vec<MemorySegment>,
         memory_regions: Vec<MemoryRegion>,
+        symbols: Vec<ElfSymbol>,
         defmt_info: DefmtInfo,
         rtt_info: RttInfo,
         current_target: String,
@@ -46,12 +54,11 @@ impl MemoryView {
             .position(|t| t == &current_target)
             .map(|row| IndexPath::default().row(row));
 
-        let target_select = cx.new(|cx| {
-            SelectState::new(delegate, selected_index, window, cx)
-                .searchable(true)
-        });
+        let target_select =
+            cx.new(|cx| SelectState::new(delegate, selected_index, window, cx).searchable(true));
 
-        cx.subscribe(&target_select, Self::on_target_select_event).detach();
+        cx.subscribe(&target_select, Self::on_target_select_event)
+            .detach();
 
         // Create theme selector
         let theme_registry = ThemeRegistry::global(cx);
@@ -69,18 +76,20 @@ impl MemoryView {
 
         let theme_delegate = SearchableVec::new(theme_names);
         let theme_select = cx.new(|cx| {
-            SelectState::new(theme_delegate, theme_selected_index, window, cx)
-                .searchable(true)
+            SelectState::new(theme_delegate, theme_selected_index, window, cx).searchable(true)
         });
 
-        cx.subscribe(&theme_select, Self::on_theme_select_event).detach();
+        cx.subscribe(&theme_select, Self::on_theme_select_event)
+            .detach();
 
         Self {
             segments,
             memory_regions,
+            symbols,
             defmt_info,
             rtt_info,
             selected_segment: None,
+            symbols_table: None,
             target_select,
             theme_select,
             elf_path,
@@ -150,10 +159,37 @@ impl MemoryView {
         &mut self,
         idx: usize,
         _: &MouseUpEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.selected_segment = Some(idx);
+        // Toggle the selected segment (click again to close)
+        if self.selected_segment == Some(idx) {
+            self.selected_segment = None;
+            self.symbols_table = None;
+        } else {
+            self.selected_segment = Some(idx);
+
+            // Filter symbols for the selected segment
+            if let Some(segment) = self.segments.get(idx) {
+                let segment_start = segment.address;
+                let segment_end = segment.address + segment.size;
+                let filtered_symbols: Vec<ElfSymbol> = self
+                    .symbols
+                    .iter()
+                    .filter(|s| s.address >= segment_start && s.address < segment_end)
+                    .cloned()
+                    .collect();
+
+                // Create or update the table with the filtered symbols
+                let delegate = SymbolsTableDelegate::new(filtered_symbols);
+                self.symbols_table = Some(cx.new(|cx| {
+                    TableState::new(delegate, window, cx)
+                        .row_selectable(false)
+                        .col_selectable(false)
+                        .sortable(true)
+                }));
+            }
+        }
         cx.notify();
     }
 
@@ -377,5 +413,38 @@ impl Render for MemoryView {
                         total_size,
                     )),
             )
+            .when_some(self.symbols_table.as_ref(), |div, table_state| {
+                let segment = self.selected_segment
+                    .and_then(|idx| self.segments.get(idx))
+                    .unwrap();
+                let symbols_count = table_state.read(cx).delegate().symbols.len();
+
+                div.child(
+                    gpui_component::v_flex()
+                        .w_full()
+                        .h(px(300.0))
+                        .border_t_1()
+                        .border_color(cx.theme().border)
+                        .child(
+                            // Header
+                            gpui::div()
+                                .px_3()
+                                .py_2()
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().sidebar)
+                                .child(
+                                    gpui::div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::BOLD)
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("Symbols in {} ({} total)", segment.name, symbols_count))
+                                )
+                        )
+                        .child(
+                            Table::new(table_state).stripe(true)
+                        )
+                )
+            })
     }
 }

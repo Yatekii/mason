@@ -1,10 +1,10 @@
-use gpui::{prelude::*, *};
-use gpui_component::description_list::{DescriptionList, DescriptionItem};
-use gpui_component::label::Label;
-use gpui_component::{ActiveTheme, StyledExt};
-use gpui_component::scroll::ScrollbarAxis;
 use crate::types::{DefmtInfo, MemorySegment, RttInfo};
 use crate::utils::format_size;
+use gpui::{prelude::*, *};
+use gpui_component::description_list::{DescriptionItem, DescriptionList};
+use gpui_component::label::Label;
+use gpui_component::scroll::ScrollbarAxis;
+use gpui_component::{ActiveTheme, StyledExt};
 
 #[derive(IntoElement)]
 pub struct DetailsPanel {
@@ -57,17 +57,28 @@ impl DetailsPanel {
             .p_4()
             .scrollable(ScrollbarAxis::Vertical);
 
+        let mut general_list = DescriptionList::horizontal().bordered(true).columns(1);
+        // general_list = general_list.child(
+        //     DescriptionItem::new("Language")
+        //         .value(self.language)
+        //         .span(1),
+        // );
+
+        panel = panel
+            .child(
+                Label::new("General")
+                    .text_lg()
+                    .font_weight(FontWeight::BOLD)
+                    .mb_2(),
+            )
+            .child(general_list);
+
         // Add defmt info section if present
         if self.defmt_info.present {
-            let mut defmt_list = DescriptionList::horizontal()
-                .bordered(true)
-                .columns(1);
+            let mut defmt_list = DescriptionList::horizontal().bordered(true).columns(1);
 
-            defmt_list = defmt_list.child(
-                DescriptionItem::new("defmt Support")
-                    .value("Yes")
-                    .span(1),
-            );
+            defmt_list =
+                defmt_list.child(DescriptionItem::new("defmt Support").value("Yes").span(1));
 
             // Add sections
             for (section_name, section_size) in &self.defmt_info.sections {
@@ -83,22 +94,16 @@ impl DetailsPanel {
                     Label::new("defmt Configuration")
                         .text_lg()
                         .font_weight(FontWeight::BOLD)
-                        .mb_2()
+                        .mb_2(),
                 )
                 .child(defmt_list);
         }
 
         // Add RTT info section if present
         if self.rtt_info.present {
-            let mut rtt_list = DescriptionList::horizontal()
-                .bordered(true)
-                .columns(1);
+            let mut rtt_list = DescriptionList::horizontal().bordered(true).columns(1);
 
-            rtt_list = rtt_list.child(
-                DescriptionItem::new("RTT Support")
-                    .value("Yes")
-                    .span(1),
-            );
+            rtt_list = rtt_list.child(DescriptionItem::new("RTT Support").value("Yes").span(1));
 
             if let Some(symbol_name) = &self.rtt_info.symbol_name {
                 rtt_list = rtt_list.child(
@@ -157,7 +162,7 @@ impl DetailsPanel {
                     Label::new("RTT Configuration")
                         .text_lg()
                         .font_weight(FontWeight::BOLD)
-                        .mb_2()
+                        .mb_2(),
                 )
                 .child(rtt_list);
         }
@@ -165,9 +170,7 @@ impl DetailsPanel {
         // Add selected segment details
         if let Some(idx) = self.selected_segment {
             if let Some(segment) = self.segments.get(idx) {
-                let mut segment_list = DescriptionList::horizontal()
-                    .bordered(true)
-                    .columns(1);
+                let mut segment_list = DescriptionList::horizontal().bordered(true).columns(1);
 
                 segment_list = segment_list
                     .child(
@@ -214,7 +217,7 @@ impl DetailsPanel {
                         Label::new("Selected Section")
                             .text_lg()
                             .font_weight(FontWeight::BOLD)
-                            .mb_2()
+                            .mb_2(),
                     )
                     .child(segment_list);
 
@@ -233,7 +236,7 @@ impl DetailsPanel {
                                     .text_sm()
                                     .font_weight(FontWeight::BOLD)
                                     .text_color(rgb(0xff4444))
-                                    .mb_2()
+                                    .mb_2(),
                             )
                             .children(segment.conflicts.iter().map(|conflict| {
                                 div()

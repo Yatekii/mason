@@ -6,10 +6,12 @@ mod utils;
 use anyhow::{Context as AnyhowContext, Result};
 use components::MemoryView;
 use gpui::*;
+use gpui_component::theme::{Theme, ThemeRegistry};
 use gpui_component::{Root, TitleBar};
-use gpui_component::theme::{ThemeRegistry, Theme};
+use gpui_component_assets::Assets;
 use parser::{
-    load_memory_layout_from_probe_rs, parse_defmt_info, parse_elf_segments, parse_rtt_info,
+    load_memory_layout_from_probe_rs, parse_defmt_info, parse_elf_segments, parse_elf_symbols,
+    parse_rtt_info,
 };
 use std::env;
 use std::path::PathBuf;
@@ -20,10 +22,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 3 {
-        eprintln!(
-            "Usage: {} <elf-file> --target <probe-rs-target>",
-            args[0]
-        );
+        eprintln!("Usage: {} <elf-file> --target <probe-rs-target>", args[0]);
         eprintln!();
         eprintln!("Example:");
         eprintln!("  {} firmware.elf --target STM32F407VGTx", args[0]);
@@ -43,10 +42,7 @@ fn main() -> Result<()> {
     // Parse target argument
     if args[2] != "--target" && args[2] != "-t" {
         eprintln!("Error: Expected --target flag");
-        eprintln!(
-            "Usage: {} <elf-file> --target <probe-rs-target>",
-            args[0]
-        );
+        eprintln!("Usage: {} <elf-file> --target <probe-rs-target>", args[0]);
         std::process::exit(1);
     }
 
@@ -65,78 +61,84 @@ fn main() -> Result<()> {
         eprintln!("Warning: No loadable segments found in ELF file");
     }
 
+    let symbols = parse_elf_symbols(&elf_path).context("Failed to parse ELF symbols")?;
+    eprintln!("Found {} symbols in ELF file", symbols.len());
+
     let defmt_info = parse_defmt_info(&elf_path).context("Failed to parse defmt info")?;
     let rtt_info = parse_rtt_info(&elf_path).context("Failed to parse RTT info")?;
 
-    Application::new().run(move |cx: &mut App| {
-        // Initialize gpui-component before using any components
-        gpui_component::init(cx);
+    Application::new()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            // Initialize gpui-component before using any components
+            gpui_component::init(cx);
 
-        // Load custom themes from themes directory
-        let themes_dir = env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("themes");
+            // Load custom themes from themes directory
+            let themes_dir = env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join("themes");
 
-        if themes_dir.exists() {
-            let _ = ThemeRegistry::watch_dir(themes_dir, cx, |cx| {
-                // Set Twilight as the default theme after themes are loaded
-                let theme_registry = ThemeRegistry::global(cx);
-                let twilight_name: SharedString = "Twilight".into();
-                if let Some(twilight_theme) = theme_registry.themes().get(&twilight_name) {
-                    let twilight_theme = twilight_theme.clone();
-                    let theme_mode = twilight_theme.mode;
+            if themes_dir.exists() {
+                let _ = ThemeRegistry::watch_dir(themes_dir, cx, |cx| {
+                    // Set Twilight as the default theme after themes are loaded
+                    let theme_registry = ThemeRegistry::global(cx);
+                    let twilight_name: SharedString = "Twilight".into();
+                    if let Some(twilight_theme) = theme_registry.themes().get(&twilight_name) {
+                        let twilight_theme = twilight_theme.clone();
+                        let theme_mode = twilight_theme.mode;
 
-                    let theme = Theme::global_mut(cx);
-                    theme.dark_theme = twilight_theme;
-                    Theme::change(theme_mode, None, cx);
-                }
-            });
-        }
-
-        let bounds = Bounds::centered(None, size(px(1600.0), px(900.0)), cx);
-
-        // Set up keyboard bindings
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-
-        // Handle quit action
-        cx.on_action(|_: &Quit, cx| cx.quit());
-
-        let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitleBar::title_bar_options()),
-            ..Default::default()
-        };
-
-        cx.spawn(async move |cx| {
-            let window = cx.open_window(window_options, |window, cx| {
-                let view = cx.new(|cx| {
-                    MemoryView::new(
-                        segments.clone(),
-                        memory_regions.clone(),
-                        defmt_info.clone(),
-                        rtt_info.clone(),
-                        args[3].clone(),
-                        elf_path.clone(),
-                        window,
-                        cx,
-                    )
+                        let theme = Theme::global_mut(cx);
+                        theme.dark_theme = twilight_theme;
+                        Theme::change(theme_mode, None, cx);
+                    }
                 });
-                // Wrap in Root component for gpui-component
-                cx.new(|cx| Root::new(view, window, cx))
-            })?;
+            }
 
-            // Get the root view entity and observe when it's released (window closed)
-            let root_view = window.update(cx, |_, _, cx| cx.entity())?;
-            cx.update(|cx| {
-                cx.observe_release(&root_view, |_, cx| cx.quit()).detach();
-            })?;
+            let bounds = Bounds::centered(None, size(px(1600.0), px(900.0)), cx);
 
-            cx.update(|cx| cx.activate(true))?;
+            // Set up keyboard bindings
+            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
 
-            Ok::<_, anyhow::Error>(())
-        })
-        .detach();
-    });
+            // Handle quit action
+            cx.on_action(|_: &Quit, cx| cx.quit());
+
+            let window_options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitleBar::title_bar_options()),
+                ..Default::default()
+            };
+
+            cx.spawn(async move |cx| {
+                let window = cx.open_window(window_options, |window, cx| {
+                    let view = cx.new(|cx| {
+                        MemoryView::new(
+                            segments.clone(),
+                            memory_regions.clone(),
+                            symbols.clone(),
+                            defmt_info.clone(),
+                            rtt_info.clone(),
+                            args[3].clone(),
+                            elf_path.clone(),
+                            window,
+                            cx,
+                        )
+                    });
+                    // Wrap in Root component for gpui-component
+                    cx.new(|cx| Root::new(view, window, cx))
+                })?;
+
+                // Get the root view entity and observe when it's released (window closed)
+                let root_view = window.update(cx, |_, _, cx| cx.entity())?;
+                cx.update(|cx| {
+                    cx.observe_release(&root_view, |_, cx| cx.quit()).detach();
+                })?;
+
+                cx.update(|cx| cx.activate(true))?;
+
+                Ok::<_, anyhow::Error>(())
+            })
+            .detach();
+        });
 
     Ok(())
 }

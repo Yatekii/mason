@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+addr2line = "0.25"
+gimli = "0.32"
 gpui = "0.2.2"
 gpui-component = { path = "../gpui-component/crates/ui" }
+gpui-component-assets = { path = "../gpui-component/crates/assets" }
 object = "0.36"
 anyhow = "1.0"
 probe-rs = "0.24"
+rustc-demangle = "0.1"
