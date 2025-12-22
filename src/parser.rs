@@ -321,7 +321,7 @@ fn decode_rtt_control_block(
 
 pub fn parse_elf_segments(
     path: &PathBuf,
-    memory_regions: &[MemoryRegion],
+    memory_regions: Option<&[MemoryRegion]>,
 ) -> Result<Vec<MemorySegment>> {
     let data = fs::read(path).context("Failed to read ELF file")?;
     let obj = object::File::parse(&*data).context("Failed to parse ELF file")?;
@@ -388,8 +388,10 @@ pub fn parse_elf_segments(
 
     segments.sort_by_key(|s| s.address);
 
-    // Detect conflicts
-    detect_conflicts(&mut segments, memory_regions);
+    // Detect conflicts (only if memory regions are provided)
+    if let Some(regions) = memory_regions {
+        detect_conflicts(&mut segments, regions);
+    }
 
     Ok(segments)
 }

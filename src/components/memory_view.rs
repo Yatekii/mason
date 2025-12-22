@@ -51,18 +51,24 @@ impl MemoryView {
         defmt_info: DefmtInfo,
         rtt_info: RttInfo,
         dwarf_info: DwarfInfo,
-        current_target: String,
+        current_target: Option<String>,
         elf_path: PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let all_targets = get_all_targets();
+        // Build target list with "None" option at the top
+        let mut all_targets = vec!["(No target)".to_string()];
+        all_targets.extend(get_all_targets());
         let delegate = SearchableVec::new(all_targets.clone());
 
-        let selected_index = all_targets
-            .iter()
-            .position(|t| t == &current_target)
-            .map(|row| IndexPath::default().row(row));
+        let selected_index = if let Some(ref target) = current_target {
+            all_targets
+                .iter()
+                .position(|t| t == target)
+                .map(|row| IndexPath::default().row(row))
+        } else {
+            Some(IndexPath::default().row(0)) // Select "(No target)"
+        };
 
         let target_select =
             cx.new(|cx| SelectState::new(delegate, selected_index, window, cx).searchable(true));
@@ -134,10 +140,10 @@ impl MemoryView {
         &mut self,
         _: Entity<SelectState<SearchableVec<String>>>,
         event: &SelectEvent<SearchableVec<String>>,
-        _: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         if let SelectEvent::Confirm(Some(target)) = event {
-            self.on_target_change((*target).clone());
+            self.on_target_change((*target).clone(), cx);
         }
     }
 
@@ -170,12 +176,30 @@ impl MemoryView {
         }
     }
 
-    fn on_target_change(&mut self, target: String) {
+    fn on_target_change(&mut self, target: String, cx: &mut Context<Self>) {
+        if target == "(No target)" {
+            // Clear target selection but keep segments
+            self.memory_regions.clear();
+            // Re-parse segments without conflict detection
+            if let Ok(segments) = parse_elf_segments(&self.elf_path, None) {
+                self.segments = segments;
+            }
+            // Clear segment-related conflicts
+            for segment in &mut self.segments {
+                segment.conflicts.clear();
+            }
+            self.selected_segment = None;
+            self.symbols_table = None;
+            cx.notify();
+            return;
+        }
+
         if let Ok(memory_regions) = load_memory_layout_from_probe_rs(&target) {
-            if let Ok(segments) = parse_elf_segments(&self.elf_path, &memory_regions) {
+            if let Ok(segments) = parse_elf_segments(&self.elf_path, Some(&memory_regions)) {
                 self.memory_regions = memory_regions;
                 self.segments = segments;
                 self.selected_segment = None;
+                self.symbols_table = None;
 
                 // Reload defmt and RTT info
                 if let Ok(defmt_info) = parse_defmt_info(&self.elf_path) {
@@ -184,6 +208,7 @@ impl MemoryView {
                 if let Ok(rtt_info) = parse_rtt_info(&self.elf_path) {
                     self.rtt_info = rtt_info;
                 }
+                cx.notify();
             }
         }
     }
@@ -354,6 +379,9 @@ impl Render for MemoryView {
         // Check if we have a bottom panel to show
         let has_bottom_panel = self.symbols_table.is_some() || self.selected_dwarf_symbol.is_some();
 
+        // Check if we have a target selected (i.e., memory regions to show)
+        let has_target = !self.memory_regions.is_empty();
+
         div()
             .flex()
             .flex_col()
@@ -457,13 +485,15 @@ impl Render for MemoryView {
                                                             }))
                                                         },
                                                     ))
-                                                    .child(render_regions_panel(
-                                                        &self.memory_regions,
-                                                        region_scale_factor,
-                                                        min_block_height,
-                                                        gap_height,
-                                                        padding,
-                                                    ))
+                                                    .when(has_target, |d| {
+                                                        d.child(render_regions_panel(
+                                                            &self.memory_regions,
+                                                            region_scale_factor,
+                                                            min_block_height,
+                                                            gap_height,
+                                                            padding,
+                                                        ))
+                                                    })
                                                     .child(DetailsPanel::new(
                                                         self.defmt_info.clone(),
                                                         self.rtt_info.clone(),

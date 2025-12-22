@@ -4,6 +4,7 @@ mod types;
 mod utils;
 
 use anyhow::{Context as AnyhowContext, Result};
+use clap::Parser;
 use components::MemoryView;
 use gpui::*;
 use gpui_component::theme::{Theme, ThemeRegistry};
@@ -16,46 +17,49 @@ use parser::{
 use std::env;
 use std::path::PathBuf;
 
+/// A DWARF debug symbol browser for ELF files
+#[derive(Parser, Debug)]
+#[command(name = "mason", version, about)]
+struct Args {
+    /// Path to the ELF file to analyze
+    elf_file: PathBuf,
+
+    /// Target chip for memory layout (e.g., STM32F407VGTx)
+    #[arg(short, long)]
+    target: Option<String>,
+}
+
 actions!(mason, [Quit]);
 
 fn main() -> Result<()> {
-    let args: Vec<String> = env::args().collect();
+    let args = Args::parse();
 
-    if args.len() < 3 {
-        eprintln!("Usage: {} <elf-file> --target <probe-rs-target>", args[0]);
-        eprintln!();
-        eprintln!("Example:");
-        eprintln!("  {} firmware.elf --target STM32F407VGTx", args[0]);
-        eprintln!();
-        eprintln!("To list available probe-rs targets, run:");
-        eprintln!("  probe-rs chip list");
-        std::process::exit(1);
-    }
-
-    let elf_path = PathBuf::from(&args[1]);
+    let elf_path = args.elf_file;
 
     if !elf_path.exists() {
         eprintln!("Error: File '{}' does not exist", elf_path.display());
         std::process::exit(1);
     }
 
-    // Parse target argument
-    if args[2] != "--target" && args[2] != "-t" {
-        eprintln!("Error: Expected --target flag");
-        eprintln!("Usage: {} <elf-file> --target <probe-rs-target>", args[0]);
-        std::process::exit(1);
-    }
+    let current_target = args.target;
 
-    if args.len() < 4 {
-        eprintln!("Error: --target requires a target name");
-        std::process::exit(1);
-    }
+    // Load memory regions if target is specified
+    let memory_regions = if let Some(ref target) = current_target {
+        load_memory_layout_from_probe_rs(target).context("Failed to load target from probe-rs")?
+    } else {
+        Vec::new()
+    };
 
-    let memory_regions = load_memory_layout_from_probe_rs(&args[3])
-        .context("Failed to load target from probe-rs")?;
-
-    let segments =
-        parse_elf_segments(&elf_path, &memory_regions).context("Failed to parse ELF segments")?;
+    // Always parse ELF segments (conflict detection only if we have memory regions)
+    let segments = parse_elf_segments(
+        &elf_path,
+        if memory_regions.is_empty() {
+            None
+        } else {
+            Some(&memory_regions)
+        },
+    )
+    .context("Failed to parse ELF segments")?;
 
     if segments.is_empty() {
         eprintln!("Warning: No loadable segments found in ELF file");
@@ -127,7 +131,7 @@ fn main() -> Result<()> {
                             defmt_info.clone(),
                             rtt_info.clone(),
                             dwarf_info.clone(),
-                            args[3].clone(),
+                            current_target.clone(),
                             elf_path.clone(),
                             window,
                             cx,
