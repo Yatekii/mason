@@ -10,8 +10,8 @@ use gpui_component::theme::{Theme, ThemeRegistry};
 use gpui_component::{Root, TitleBar};
 use gpui_component_assets::Assets;
 use parser::{
-    load_memory_layout_from_probe_rs, parse_defmt_info, parse_elf_segments, parse_elf_symbols,
-    parse_rtt_info,
+    load_memory_layout_from_probe_rs, parse_defmt_info, parse_dwarf_info, parse_elf_segments,
+    parse_elf_symbols, parse_rtt_info,
 };
 use std::env;
 use std::path::PathBuf;
@@ -66,6 +66,15 @@ fn main() -> Result<()> {
 
     let defmt_info = parse_defmt_info(&elf_path).context("Failed to parse defmt info")?;
     let rtt_info = parse_rtt_info(&elf_path).context("Failed to parse RTT info")?;
+    let dwarf_info = parse_dwarf_info(&elf_path).unwrap_or_else(|e| {
+        eprintln!("Warning: Failed to parse DWARF info: {}", e);
+        types::DwarfInfo::default()
+    });
+    eprintln!(
+        "Found {} DWARF compile units with {} total symbols",
+        dwarf_info.compile_units.len(),
+        dwarf_info.total_symbols
+    );
 
     Application::new()
         .with_assets(Assets)
@@ -117,6 +126,7 @@ fn main() -> Result<()> {
                             symbols.clone(),
                             defmt_info.clone(),
                             rtt_info.clone(),
+                            dwarf_info.clone(),
                             args[3].clone(),
                             elf_path.clone(),
                             window,

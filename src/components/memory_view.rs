@@ -1,11 +1,17 @@
 use crate::components::symbols_panel::SymbolsTableDelegate;
-use crate::components::{render_regions_panel, render_sections_panel, DetailsPanel};
+use crate::components::{
+    render_regions_panel, render_sections_panel, DetailsPanel, DwarfDetailsPanel,
+    DwarfSymbolSelectEvent, DwarfTreePanel,
+};
 use crate::parser::{
     get_all_targets, load_memory_layout_from_probe_rs, parse_defmt_info, parse_elf_segments,
     parse_rtt_info,
 };
-use crate::types::{DefmtInfo, ElfSymbol, MemoryRegion, MemorySegment, RttInfo};
+use crate::types::{
+    DefmtInfo, DwarfInfo, DwarfSymbol, ElfSymbol, MemoryRegion, MemorySegment, RttInfo,
+};
 use gpui::{prelude::*, *};
+use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_component::table::{Table, TableState};
 use gpui_component::theme::{Theme, ThemeRegistry};
@@ -20,8 +26,11 @@ pub struct MemoryView {
     symbols: Vec<ElfSymbol>,
     defmt_info: DefmtInfo,
     rtt_info: RttInfo,
+    dwarf_info: DwarfInfo,
     selected_segment: Option<usize>,
+    selected_dwarf_symbol: Option<DwarfSymbol>,
     symbols_table: Option<Entity<TableState<SymbolsTableDelegate>>>,
+    dwarf_tree_panel: Entity<DwarfTreePanel>,
     target_select: Entity<SelectState<SearchableVec<String>>>,
     theme_select: Entity<SelectState<SearchableVec<String>>>,
     elf_path: PathBuf,
@@ -41,6 +50,7 @@ impl MemoryView {
         symbols: Vec<ElfSymbol>,
         defmt_info: DefmtInfo,
         rtt_info: RttInfo,
+        dwarf_info: DwarfInfo,
         current_target: String,
         elf_path: PathBuf,
         window: &mut Window,
@@ -58,6 +68,13 @@ impl MemoryView {
             cx.new(|cx| SelectState::new(delegate, selected_index, window, cx).searchable(true));
 
         cx.subscribe(&target_select, Self::on_target_select_event)
+            .detach();
+
+        // Create DWARF tree panel
+        let dwarf_info_clone = dwarf_info.clone();
+        let dwarf_tree_panel = cx.new(|cx| DwarfTreePanel::new(dwarf_info_clone, window, cx));
+
+        cx.subscribe(&dwarf_tree_panel, Self::on_dwarf_symbol_select)
             .detach();
 
         // Create theme selector
@@ -88,13 +105,29 @@ impl MemoryView {
             symbols,
             defmt_info,
             rtt_info,
+            dwarf_info,
             selected_segment: None,
+            selected_dwarf_symbol: None,
             symbols_table: None,
+            dwarf_tree_panel,
             target_select,
             theme_select,
             elf_path,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    fn on_dwarf_symbol_select(
+        &mut self,
+        _: Entity<DwarfTreePanel>,
+        event: &DwarfSymbolSelectEvent,
+        cx: &mut Context<Self>,
+    ) {
+        // Clear ELF segment selection so DWARF details panel is shown
+        self.selected_segment = None;
+        self.symbols_table = None;
+        self.selected_dwarf_symbol = Some(event.symbol.clone());
+        cx.notify();
     }
 
     fn on_target_select_event(
@@ -318,6 +351,9 @@ impl Render for MemoryView {
             min_block_height,
         );
 
+        // Check if we have a bottom panel to show
+        let has_bottom_panel = self.symbols_table.is_some() || self.selected_dwarf_symbol.is_some();
+
         div()
             .flex()
             .flex_col()
@@ -346,105 +382,158 @@ impl Render for MemoryView {
                     )
             )
             .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .overflow_hidden()
+                // Outer vertical resizable: main content + bottom panel
+                v_resizable("main-v-resizable")
                     .child(
-                        // Left sidebar with target selector
-                        div()
-                            .flex()
-                            .flex_col()
-                            .w(px(280.0))
-                            .h_full()
-                            .flex_shrink_0()
-                            .overflow_hidden()
-                            .bg(cx.theme().sidebar)
-                            .text_color(cx.theme().sidebar_foreground)
-                            .border_r_1()
-                            .border_color(cx.theme().sidebar_border)
+                        // Main content area (grows to fill space)
+                        resizable_panel()
                             .child(
-                                div()
-                                    .p_4()
+                                // Inner horizontal resizable: left sidebar + content
+                                h_resizable("main-h-resizable")
                                     .child(
-                                        v_flex()
-                                            .gap_2()
-                                            .w_full()
+                                        // Left sidebar with target selector and DWARF tree
+                                        resizable_panel()
+                                            .size(px(320.0))
+                                            .size_range(px(200.0)..px(500.0))
                                             .child(
                                                 div()
-                                                    .text_sm()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child("Target Chip")
+                                                    .flex()
+                                                    .flex_col()
+                                                    .size_full()
+                                                    .overflow_hidden()
+                                                    .bg(cx.theme().sidebar)
+                                                    .text_color(cx.theme().sidebar_foreground)
+                                                    .border_r_1()
+                                                    .border_color(cx.theme().sidebar_border)
+                                                    .child(
+                                                        div()
+                                                            .p_4()
+                                                            .border_b_1()
+                                                            .border_color(cx.theme().border)
+                                                            .child(
+                                                                v_flex()
+                                                                    .gap_2()
+                                                                    .w_full()
+                                                                    .child(
+                                                                        div()
+                                                                            .text_sm()
+                                                                            .font_weight(FontWeight::SEMIBOLD)
+                                                                            .child("Target Chip")
+                                                                    )
+                                                                    .child(
+                                                                        Select::new(&self.target_select)
+                                                                            .small()
+                                                                            .placeholder("Select target...")
+                                                                            .search_placeholder("Search targets...")
+                                                                    )
+                                                            )
+                                                    )
+                                                    .child(
+                                                        // DWARF tree panel takes remaining space
+                                                        div()
+                                                            .flex_1()
+                                                            .overflow_hidden()
+                                                            .child(self.dwarf_tree_panel.clone())
+                                                    )
                                             )
+                                    )
+                                    .child(
+                                        // Main content panels (sections, regions, details)
+                                        resizable_panel()
                                             .child(
-                                                Select::new(&self.target_select)
-                                                    .small()
-                                                    .placeholder("Select target...")
-                                                    .search_placeholder("Search targets...")
+                                                div()
+                                                    .flex()
+                                                    .size_full()
+                                                    .child(render_sections_panel(
+                                                        &self.segments,
+                                                        selected_segment,
+                                                        scale_factor,
+                                                        min_block_height,
+                                                        gap_height,
+                                                        padding,
+                                                        |idx| {
+                                                            Box::new(cx.listener(move |view: &mut MemoryView, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<MemoryView>| {
+                                                                view.on_segment_click(idx, event, window, cx);
+                                                            }))
+                                                        },
+                                                    ))
+                                                    .child(render_regions_panel(
+                                                        &self.memory_regions,
+                                                        region_scale_factor,
+                                                        min_block_height,
+                                                        gap_height,
+                                                        padding,
+                                                    ))
+                                                    .child(DetailsPanel::new(
+                                                        self.defmt_info.clone(),
+                                                        self.rtt_info.clone(),
+                                                        self.segments.clone(),
+                                                        selected_segment,
+                                                        total_size,
+                                                    ))
                                             )
                                     )
                             )
                     )
-                    .child(render_sections_panel(
-                        &self.segments,
-                        selected_segment,
-                        scale_factor,
-                        min_block_height,
-                        gap_height,
-                        padding,
-                        |idx| {
-                            Box::new(cx.listener(move |view: &mut MemoryView, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<MemoryView>| {
-                                view.on_segment_click(idx, event, window, cx);
-                            }))
-                        },
-                    ))
-                    .child(render_regions_panel(
-                        &self.memory_regions,
-                        region_scale_factor,
-                        min_block_height,
-                        gap_height,
-                        padding,
-                    ))
-                    .child(DetailsPanel::new(
-                        self.defmt_info.clone(),
-                        self.rtt_info.clone(),
-                        self.segments.clone(),
-                        selected_segment,
-                        total_size,
-                    )),
-            )
-            .when_some(self.symbols_table.as_ref(), |div, table_state| {
-                let segment = self.selected_segment
-                    .and_then(|idx| self.segments.get(idx))
-                    .unwrap();
-                let symbols_count = table_state.read(cx).delegate().symbols.len();
+                    // Bottom panel: show ELF symbols table OR DWARF symbol details
+                    .when(has_bottom_panel, |group| {
+                        if let Some(table_state) = self.symbols_table.as_ref() {
+                            // ELF segment selected - show symbols table
+                            let segment = self.selected_segment
+                                .and_then(|idx| self.segments.get(idx))
+                                .unwrap();
+                            let symbols_count = table_state.read(cx).delegate().symbols.len();
 
-                div.child(
-                    gpui_component::v_flex()
-                        .w_full()
-                        .h(px(300.0))
-                        .border_t_1()
-                        .border_color(cx.theme().border)
-                        .child(
-                            // Header
-                            gpui::div()
-                                .px_3()
-                                .py_2()
-                                .border_b_1()
-                                .border_color(cx.theme().border)
-                                .bg(cx.theme().sidebar)
-                                .child(
-                                    gpui::div()
-                                        .text_sm()
-                                        .font_weight(FontWeight::BOLD)
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("Symbols in {} ({} total)", segment.name, symbols_count))
-                                )
-                        )
-                        .child(
-                            Table::new(table_state).stripe(true)
-                        )
-                )
-            })
+                            group.child(
+                                resizable_panel()
+                                    .size(px(400.0))
+                                    .size_range(px(400.0)..px(800.0))
+                                    .child(
+                                        gpui_component::v_flex()
+                                            .size_full()
+                                            .border_t_1()
+                                            .border_color(cx.theme().border)
+                                            .child(
+                                                // Header
+                                                gpui::div()
+                                                    .px_3()
+                                                    .py_2()
+                                                    .border_b_1()
+                                                    .border_color(cx.theme().border)
+                                                    .bg(cx.theme().sidebar)
+                                                    .child(
+                                                        gpui::div()
+                                                            .text_sm()
+                                                            .font_weight(FontWeight::BOLD)
+                                                            .text_color(cx.theme().muted_foreground)
+                                                            .child(format!("Symbols in {} ({} total)", segment.name, symbols_count))
+                                                    )
+                                            )
+                                            .child(
+                                                Table::new(table_state).stripe(true).bordered(false)
+                                            )
+                                    )
+                            )
+                        } else if self.selected_dwarf_symbol.is_some() {
+                            // DWARF symbol selected - show details panel at bottom
+                            group.child(
+                                resizable_panel()
+                                    .size(px(400.0))
+                                    .size_range(px(400.0)..px(800.0))
+                                    .child(
+                                        gpui_component::v_flex()
+                                            .size_full()
+                                            .border_t_1()
+                                            .border_color(cx.theme().border)
+                                            .child(DwarfDetailsPanel::new(
+                                                self.selected_dwarf_symbol.clone(),
+                                            ))
+                                    )
+                            )
+                        } else {
+                            group
+                        }
+                    })
+            )
     }
 }
