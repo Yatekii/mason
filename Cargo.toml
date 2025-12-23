@@ -8,8 +8,8 @@ addr2line = "0.25"
 clap = { version = "4", features = ["derive"] }
 gimli = "0.32"
 gpui = "0.2.2"
-gpui-component = { path = "../gpui-component/crates/ui" }
-gpui-component-assets = { path = "../gpui-component/crates/assets" }
+gpui-component = { git = "https://github.com/longbridge/gpui-component.git", rev = "aa4f896b" }
+gpui-component-assets = { git = "https://github.com/longbridge/gpui-component.git", rev = "aa4f896b" }
 object = "0.36"
 anyhow = "1.0"
 probe-rs = "0.24"
