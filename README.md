@@ -2,6 +2,8 @@
 
 A beautiful DWARF debug symbol browser for ELF files built with [GPUI](https://github.com/zed-industries/zed/tree/main/crates/gpui).
 
+![Screenshot](img/screenshot.png)
+
 ## Features
 
 - Browse DWARF debug symbols
